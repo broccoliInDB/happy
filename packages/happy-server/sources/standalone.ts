@@ -193,8 +193,11 @@ async function runPostgresMigrations(migrationsDirResolved: string) {
 }
 
 async function serve() {
-    // Ensure DB_PROVIDER is set for db.ts
-    process.env.DB_PROVIDER = process.env.DB_PROVIDER || "pglite";
+    // Ensure DB_PROVIDER is set for db.ts. Key off DATABASE_URL the same way the
+    // migrate path and the happy-cli wrapper do, so running standalone serve
+    // directly (without the CLI) against external Postgres doesn't fall back to
+    // PGlite. PGLITE_DIR is harmless in postgres mode (db.ts ignores it).
+    process.env.DB_PROVIDER = process.env.DB_PROVIDER || (process.env.DATABASE_URL ? "postgres" : "pglite");
     process.env.PGLITE_DIR = process.env.PGLITE_DIR || pgliteDir;
 
     const masterSecret = process.env.HANDY_MASTER_SECRET;
