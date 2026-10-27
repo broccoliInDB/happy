@@ -19,13 +19,52 @@ crypto.subtle.importKey = function (format: any, keyData: any, algorithm: any, e
 
 import * as fs from "fs";
 import * as path from "path";
+import { spawn } from "child_process";
+import { createRequire } from "module";
 import { createPGlite } from "./storage/pgliteLoader";
+
+const require_ = createRequire(import.meta.url);
 
 const dataDir = process.env.DATA_DIR || "./data";
 const pgliteDir = process.env.PGLITE_DIR || path.join(dataDir, "pglite");
 
+// Locate prisma/migrations — explicit arg wins; fall back to the usual layouts.
+// Shared by both the PGlite and external-Postgres migration paths.
+function resolveMigrationsDir(explicit?: string): string {
+    const candidates: string[] = [];
+    if (explicit) candidates.push(explicit);
+    candidates.push(
+        path.join(process.cwd(), "prisma", "migrations"),
+        path.join(process.cwd(), "packages", "happy-server", "prisma", "migrations"),
+        path.join(path.dirname(process.execPath), "prisma", "migrations"),
+    );
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) {
+            return candidate;
+        }
+    }
+    throw new Error(`Could not find prisma/migrations directory. Tried: ${candidates.join(", ")}`);
+}
+
 export async function runMigrations(opts: { pgliteDir: string; migrationsDir?: string } = { pgliteDir }) {
-    const targetPgliteDir = opts.pgliteDir;
+    const migrationsDirResolved = resolveMigrationsDir(opts.migrationsDir);
+
+    // DATABASE_URL is the signal the rest of the self-host path keys on
+    // (packages/happy-cli/src/commands/server.ts sets DATABASE_URL + DB_PROVIDER=postgres
+    //  together; storage/db.ts uses the native Prisma engine when DB_PROVIDER !== pglite).
+    // When it is set we must migrate that external Postgres, NOT a throwaway PGlite.
+    if (process.env.DATABASE_URL) {
+        await runPostgresMigrations(migrationsDirResolved);
+        return;
+    }
+
+    await runPgliteMigrations(opts.pgliteDir, migrationsDirResolved);
+}
+
+// Embedded PGlite path (default; unchanged behaviour). Hand-rolled migration
+// runner: applies each migration.sql and tracks applied names in a local
+// _prisma_migrations table.
+async function runPgliteMigrations(targetPgliteDir: string, migrationsDirResolved: string) {
     console.log(`Migrating database in ${targetPgliteDir}...`);
     fs.mkdirSync(targetPgliteDir, { recursive: true });
 
@@ -42,25 +81,6 @@ export async function runMigrations(opts: { pgliteDir: string; migrationsDir?: s
             "logs" TEXT
         );
     `);
-
-    // Find migrations directory - explicit arg wins; fall back to defaults.
-    let migrationsDirResolved = "";
-    const candidates: string[] = [];
-    if (opts.migrationsDir) candidates.push(opts.migrationsDir);
-    candidates.push(
-        path.join(process.cwd(), "prisma", "migrations"),
-        path.join(process.cwd(), "packages", "happy-server", "prisma", "migrations"),
-        path.join(path.dirname(process.execPath), "prisma", "migrations"),
-    );
-    for (const candidate of candidates) {
-        if (fs.existsSync(candidate)) {
-            migrationsDirResolved = candidate;
-            break;
-        }
-    }
-    if (!migrationsDirResolved) {
-        throw new Error(`Could not find prisma/migrations directory. Tried: ${candidates.join(", ")}`);
-    }
 
     // Get all migration directories sorted
     const dirs = fs.readdirSync(migrationsDirResolved)
@@ -106,6 +126,61 @@ export async function runMigrations(opts: { pgliteDir: string; migrationsDir?: s
     }
 
     await pg.close();
+}
+
+// External Postgres path. The committed migrations are standard PostgreSQL
+// (datasource provider = "postgresql"), so we hand them to Prisma's own
+// `migrate deploy` rather than re-implementing a multi-statement executor:
+//   - `pg` (node-postgres) is NOT a dependency of this package, so there is no
+//     client here that can run a multi-statement migration.sql in one call
+//     (PrismaClient.$executeRawUnsafe rejects multi-statement SQL).
+//   - `prisma` IS a direct dependency (6.19.2, with @prisma/engines), and
+//     `migrate deploy` applies the exact same migration.sql files and maintains
+//     the canonical _prisma_migrations table — identical tracking semantics to
+//     the PGlite loop above, but owned by the tool instead of duplicated here.
+// DATABASE_URL is read from the environment by the schema's datasource.
+async function runPostgresMigrations(migrationsDirResolved: string) {
+    const prismaDir = path.dirname(migrationsDirResolved);
+    const schemaPath = path.join(prismaDir, "schema.prisma");
+    if (!fs.existsSync(schemaPath)) {
+        throw new Error(`Could not find prisma/schema.prisma next to migrations (expected ${schemaPath})`);
+    }
+
+    let prismaCli: string;
+    try {
+        // Resolves to prisma's CLI entry (build/index.js) from this package's deps.
+        prismaCli = require_.resolve("prisma");
+    } catch {
+        throw new Error(
+            "External Postgres migration needs the 'prisma' CLI, which could not be resolved. " +
+            "Install dependencies in packages/happy-server (pnpm install) and retry."
+        );
+    }
+
+    console.log("Migrating external Postgres (prisma migrate deploy)...");
+
+    await new Promise<void>((resolve, reject) => {
+        const child = spawn(
+            process.execPath,
+            [prismaCli, "migrate", "deploy", "--schema", schemaPath],
+            {
+                // Run from the package root so prisma resolves its engines + any .env.
+                cwd: path.dirname(prismaDir),
+                env: process.env,
+                stdio: "inherit",
+            },
+        );
+        child.on("error", e => reject(new Error(`Failed to run prisma migrate deploy: ${e.message}`)));
+        child.on("exit", code => {
+            if (code === 0) {
+                resolve();
+            } else {
+                reject(new Error(`prisma migrate deploy exited with code ${code}`));
+            }
+        });
+    });
+
+    console.log("Postgres migrations applied.");
 }
 
 async function serve() {

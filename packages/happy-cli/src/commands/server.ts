@@ -92,10 +92,16 @@ export async function handleServerCommand(args: string[]): Promise<void> {
 
     const staticDir = artifacts.webappDir ?? findWebappDir();
 
+    // When DATABASE_URL is set we run against an external Postgres (native Prisma
+    // engine); otherwise default to the embedded PGlite as before.
+    const databaseUrl = process.env.DATABASE_URL?.trim();
+    const usePostgres = Boolean(databaseUrl);
+
     console.log(chalk.cyan(`\n  happy server`));
     console.log(chalk.gray(`  data dir:   ${dataDir}`));
     console.log(chalk.gray(`  server url: ${serverUrl}`));
     console.log(chalk.gray(`  mode:       ${serverArtifactMode(artifacts)}`));
+    console.log(chalk.gray(`  db:         ${usePostgres ? 'external postgres (DATABASE_URL)' : 'embedded pglite'}`));
     if (staticDir) {
         console.log(chalk.gray(`  webapp:     ${staticDir}`));
     } else {
@@ -105,13 +111,14 @@ export async function handleServerCommand(args: string[]): Promise<void> {
 
     const env: NodeJS.ProcessEnv = {
         ...process.env,
-        DB_PROVIDER: 'pglite',
+        DB_PROVIDER: usePostgres ? 'postgres' : 'pglite',
         DATA_DIR: dataDir,
-        PGLITE_DIR: pgliteDir,
         HANDY_MASTER_SECRET: masterSecret,
         PORT: String(opts.port),
         HOST: opts.host,
     };
+    // PGLITE_DIR is only meaningful in embedded mode; omit it for external Postgres.
+    if (!usePostgres) env.PGLITE_DIR = pgliteDir;
     if (staticDir) env.HAPPY_STATIC_DIR = staticDir;
     env.HAPPY_INJECT_HTML_CONFIG = JSON.stringify({
         serverUrl,
