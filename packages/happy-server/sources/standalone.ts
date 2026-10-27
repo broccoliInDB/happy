@@ -146,14 +146,23 @@ async function runPostgresMigrations(migrationsDirResolved: string) {
         throw new Error(`Could not find prisma/schema.prisma next to migrations (expected ${schemaPath})`);
     }
 
+    // The `prisma` package has no library entry resolvable as a bare specifier,
+    // so require.resolve("prisma") throws. Resolve its package.json instead (always
+    // resolvable) and derive the CLI entry from its `bin` field.
     let prismaCli: string;
     try {
-        // Resolves to prisma's CLI entry (build/index.js) from this package's deps.
-        prismaCli = require_.resolve("prisma");
-    } catch {
+        const prismaPkgJson = require_.resolve("prisma/package.json");
+        const prismaPkgDir = path.dirname(prismaPkgJson);
+        const prismaPkg = JSON.parse(fs.readFileSync(prismaPkgJson, "utf-8"));
+        const binRel = typeof prismaPkg.bin === "string" ? prismaPkg.bin : prismaPkg.bin?.prisma;
+        if (!binRel) {
+            throw new Error("prisma package.json has no `bin` entry");
+        }
+        prismaCli = path.join(prismaPkgDir, binRel);
+    } catch (e: any) {
         throw new Error(
-            "External Postgres migration needs the 'prisma' CLI, which could not be resolved. " +
-            "Install dependencies in packages/happy-server (pnpm install) and retry."
+            "External Postgres migration needs the 'prisma' CLI, which could not be resolved " +
+            `(${e.message}). Install dependencies (pnpm install) and retry.`
         );
     }
 
